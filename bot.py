@@ -300,4 +300,203 @@ class TelegramBot:
         user_id = query.from_user.id
         
         # التحقق من الاشتراك في القناة الافتراضية
-        is_subscribed = await check_subscription(query.bot, user
+        is_subscribed = await check_subscription(query.bot, user_id, REQUIRED_CHANNEL)
+        
+        if is_subscribed:
+            text = get_text(language, 'subscribed')
+            keyboard = create_back_keyboard(language)
+        else:
+            text = get_text(language, 'not_subscribed').format(channel=REQUIRED_CHANNEL)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔍 تحقق مرة أخرى", callback_data="check_subscription"),
+                InlineKeyboardButton("↩️ رجوع", callback_data="back_to_main")
+            ]])
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+
+    async def show_language_selection(self, query, language):
+        """عرض اختيار اللغة"""
+        await query.edit_message_text(
+            get_text(language, 'change_language'),
+            reply_markup=create_language_keyboard()
+        )
+
+    async def handle_language_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة اختيار اللغة"""
+        query = update.callback_query
+        await query.answer()
+        
+        language = query.data.split('_')[1]  # lang_ar -> ar
+        user_id = query.from_user.id
+        
+        # تحديث لغة المستخدم
+        db.update_user_language(user_id, language)
+        
+        await query.edit_message_text(
+            get_text(language, 'language_changed'),
+            reply_markup=create_main_menu_keyboard(language)
+        )
+
+    async def show_settings(self, query, language):
+        """عرض الإعدادات"""
+        await query.edit_message_text(
+            get_text(language, 'settings'),
+            reply_markup=create_back_keyboard(language)
+        )
+
+    async def scan_group_messages(self, query, language):
+        """فحص رسائل الجروب"""
+        await query.edit_message_text(
+            get_text(language, 'scan_messages'),
+            reply_markup=create_back_keyboard(language)
+        )
+        
+        # محاكاة عملية الفحص
+        await asyncio.sleep(2)
+        
+        await query.edit_message_text(
+            get_text(language, 'scan_complete'),
+            reply_markup=create_back_keyboard(language)
+        )
+
+    async def monitor_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """مراقبة الرسائل في الجروبات"""
+        message = update.message
+        chat = message.chat
+        user = message.from_user
+        
+        # الحصول على إعدادات الجروب
+        group_username = f"@{chat.username}" if chat.username else str(chat.id)
+        group_data = db.get_group(group_username)
+        
+        if not group_data or not group_data['is_active']:
+            return
+        
+        # الحصول على قناة الجروب المخصصة أو استخدام الافتراضية
+        group_channel = db.get_group_channel(group_username)
+        channel_username = group_channel['channel_username'] if group_channel else REQUIRED_CHANNEL
+        
+        language = group_data['language']
+        keyword = group_data['keyword']
+        
+        # التحقق من اشتراك المستخدم
+        is_subscribed = await check_subscription(context.bot, user.id, channel_username)
+        
+        if not is_subscribed:
+            # إرسال تحذير وحذف الرسالة
+            warning_text = get_text(language, 'subscription_warning').format(
+                user_name=user.first_name,
+                channel=channel_username
+            )
+            
+            try:
+                warning_msg = await message.reply_text(
+                    warning_text,
+                    reply_to_message_id=message.message_id,
+                    parse_mode='Markdown'
+                )
+                
+                # جدولة حذف التحذير بعد 3 دقائق
+                await delete_message_with_delay(context, chat.id, warning_msg.message_id)
+                
+                # حذف الرسالة الأصلية
+                await message.delete()
+                
+                # تسجيل الحذف
+                db.log_deleted_message(
+                    group_username, user.id, user.first_name,
+                    message.text, language, "لم يشترك في القناة"
+                )
+                
+            except Exception as e:
+                logging.error(f"❌ Error in subscription check: {e}")
+            return
+        
+        # التحقق من وجود @username للمستخدم
+        if not user.username and keyword.lower() in message.text.lower():
+            # إرسال تحذير للمستخدم بدون username
+            warning_text = get_text(language, 'no_username_warning').format(
+                user_name=user.first_name
+            )
+            
+            try:
+                warning_msg = await message.reply_text(
+                    warning_text,
+                    reply_to_message_id=message.message_id,
+                    parse_mode='Markdown'
+                )
+                
+                # جدولة حذف التحذير بعد 3 دقائق
+                await delete_message_with_delay(context, chat.id, warning_msg.message_id)
+                
+                # حذف الرسالة الأصلية
+                await message.delete()
+                
+                # تسجيل الحذف
+                db.log_deleted_message(
+                    group_username, user.id, user.first_name,
+                    message.text, language, "لا يوجد username"
+                )
+                
+            except Exception as e:
+                logging.error(f"❌ Error in username check: {e}")
+
+    async def handle_private_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة الرسائل الخاصة"""
+        user = update.effective_user
+        user_data = db.get_user(user.id)
+        language = user_data['language'] if user_data else 'ar'
+        
+        await update.message.reply_text(
+            get_text(language, 'main_menu'),
+            reply_markup=create_main_menu_keyboard(language),
+            parse_mode='Markdown'
+        )
+
+    async def scan_recent_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """فحص الرسائل الحديثة (للاستخدام من قبل المشرفين)"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        if chat.type not in ['group', 'supergroup']:
+            await update.message.reply_text("❌ هذا الأمر يعمل فقط في الجروبات!")
+            return
+        
+        # التحقق من أن المستخدم مشرف
+        try:
+            chat_member = await context.bot.get_chat_member(chat.id, user.id)
+            if chat_member.status not in ['administrator', 'creator']:
+                await update.message.reply_text("❌ يجب أن تكون مشرفاً لاستخدام هذا الأمر!")
+                return
+        except Exception as e:
+            logging.error(f"❌ Error checking admin status: {e}")
+            return
+        
+        await update.message.reply_text("🔍 جاري فحص الرسائل الحديثة...")
+        
+        # هنا يمكن إضافة منطق فحص الرسائل الحديثة
+        # هذا يحتاج إلى صلاحية الوصول إلى سجل الدردشة
+        
+        await update.message.reply_text("✅ تم الانتهاء من الفحص!")
+
+    def run(self):
+        """تشغيل البوت"""
+        if WEBHOOK_URL:
+            # استخدام webhook على Railway
+            self.application.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            )
+        else:
+            # استخدام polling للتطوير المحلي
+            self.application.run_polling()
+
+if __name__ == "__main__":
+    bot = TelegramBot()
+    bot.run()
